@@ -12,7 +12,7 @@ import yfinance as yf
 # CONFIGURAÇÃO DA PÁGINA STREAMLIT
 # ============================================================
 st.set_page_config(
-    page_title="B3 Quant Monitor 5m — Robô Multiativos",
+    page_title="B3 Quant Monitor 5m — Robô Fracionário",
     page_icon="📈",
     layout="wide",
 )
@@ -36,27 +36,18 @@ st.markdown(
         font-weight: bold;
         font-size: 0.85rem;
     }
+    .ft-box {
+        background-color: #161b22;
+        padding: 10px;
+        border-radius: 6px;
+        border-left: 4px solid #29b6f6;
+        margin-top: 10px;
+        font-size: 0.95rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-# ============================================================
-# LISTA DE ATIVOS DA B3
-# ============================================================
-LISTA_TICKERS = [
-    "PETR4.SA", "VALE3.SA", "BOVA11.SA", "ITUB4.SA", "BBAS3.SA", 
-    "MGLU3.SA", "BBDC4.SA", "B3SA3.SA", "PRIO3.SA", "CSNA3.SA", 
-    "GGBR4.SA", "ELET3.SA", "CPLE6.SA", "ABEV3.SA", "LREN3.SA", 
-    "RENT3.SA", "RADL3.SA", "JBSS3.SA", "WEGE3.SA", "EMBR3.SA", 
-    "SUZB3.SA", "HAPV3.SA"
-]
-
-def obter_ticker_fracionario(symbol):
-    base = symbol.replace(".SA", "")
-    if base.endswith("11"):
-        return f"{base}.SA"
-    return f"{base}F.SA"
 
 # ============================================================
 # BANCO DE DADOS PERSISTENTE (SQLITE)
@@ -103,6 +94,7 @@ def init_db():
             value TEXT NOT NULL
         )
     """)
+    
     cursor.execute("SELECT COUNT(*) FROM account")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO account (balance, pnl_total) VALUES (1000.0, 0.0)")
@@ -110,21 +102,6 @@ def init_db():
     conn.close()
 
 init_db()
-
-def get_setting(key, default):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-def set_setting(key, value):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-    conn.commit()
-    conn.close()
 
 def get_account_info():
     conn = get_conn()
@@ -144,6 +121,38 @@ def reset_db(initial_capital=1000.0):
     conn.commit()
     conn.close()
 
+def save_setting(key, val):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(val)))
+    conn.commit()
+    conn.close()
+
+def load_setting(key, default_val):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else default_val
+
+# ============================================================
+# LISTA DE 22 ATIVOS DA B3 & MAPEAMENTO FRACIONÁRIO (F)
+# ============================================================
+LISTA_ATIVOS = [
+    "PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBAS3.SA", "BBDC4.SA", 
+    "B3SA3.SA", "PRIO3.SA", "CSNA3.SA", "GGBR4.SA", "ELET3.SA", 
+    "CPLE6.SA", "MGLU3.SA", "ABEV3.SA", "LREN3.SA", "RENT3.SA", 
+    "RADL3.SA", "JBSS3.SA", "WEGE3.SA", "EMBR3.SA", "SUZB3.SA", 
+    "HAPV3.SA", "BOVA11.SA"
+]
+
+def obter_ticker_fracionario(symbol):
+    base = symbol.replace(".SA", "")
+    if base.endswith("11"):
+        return f"{base}.SA"
+    return f"{base}F.SA"
+
 # ============================================================
 # AUTO-REFRESH DE 5 MINUTOS (300 SEGUNDOS)
 # ============================================================
@@ -160,51 +169,53 @@ st.components.v1.html(
 )
 
 # ============================================================
-# SIDEBAR - PARÂMETROS E PERSISTÊNCIA
+# SIDEBAR - PARÂMETROS COM PERSISTÊNCIA
 # ============================================================
 st.sidebar.title("⚙️ Configurações B3 Quant")
 
-saved_ticker = get_setting("selected_ticker", "PETR4.SA")
-saved_tf = get_setting("timeframe", "5m (Intraday)")
-saved_modo = get_setting("modo_alvo", "Estratégia G — Expansão de Abertura (1.5%)")
-saved_robo = get_setting("robo_ativo", "True") == "True"
+default_ticker = load_setting("selected_ticker", "GGBR4.SA")
+if default_ticker not in LISTA_ATIVOS:
+    default_ticker = "GGBR4.SA"
 
 ticker_selecionado = st.sidebar.selectbox(
-    "Selecione o Ativo no Painel:",
-    LISTA_TICKERS,
-    index=LISTA_TICKERS.index(saved_ticker) if saved_ticker in LISTA_TICKERS else 0,
+    "Selecione o Ativo para Visualizar:",
+    LISTA_ATIVOS,
+    index=LISTA_ATIVOS.index(default_ticker),
 )
-if ticker_selecionado != saved_ticker:
-    set_setting("selected_ticker", ticker_selecionado)
+save_setting("selected_ticker", ticker_selecionado)
 
 ticker_frac = obter_ticker_fracionario(ticker_selecionado)
 
+default_tf = load_setting("timeframe", "5m (Intraday)")
 timeframe = st.sidebar.radio(
     "Tempo Gráfico:",
     ["5m (Intraday)", "1d (Diário)"],
-    index=0 if "5m" in saved_tf else 1,
+    index=0 if "5m" in default_tf else 1,
 )
-if timeframe != saved_tf:
-    set_setting("timeframe", timeframe)
+save_setting("timeframe", timeframe)
+
+OPCOES_ESTRATEGIA = [
+    "Estratégia G — Expansão de Abertura (1.5%)",
+    "Estratégia F — First Touch (Sniper nas Paredes)",
+    "Estratégia Volatilidade — 2.0x ATR"
+]
+default_strat = load_setting("estrategia_modo", OPCOES_ESTRATEGIA[0])
+if default_strat not in OPCOES_ESTRATEGIA:
+    default_strat = OPCOES_ESTRATEGIA[0]
 
 modo_alvo = st.sidebar.radio(
-    "Método Operacional:",
-    [
-        "Estratégia G — Expansão de Abertura (1.5%)",
-        "Estratégia F — First Touch (Sniper nas Paredes)",
-        "Estratégia Volatilidade — ATR (2.0x ATR)"
-    ],
-    index=0 if "Expansão" in saved_modo else (1 if "First Touch" in saved_modo else 2),
+    "Modelo de Execução / Estratégia:",
+    OPCOES_ESTRATEGIA,
+    index=OPCOES_ESTRATEGIA.index(default_strat),
 )
-if modo_alvo != saved_modo:
-    set_setting("modo_alvo", modo_alvo)
+save_setting("estrategia_modo", modo_alvo)
 
-robo_ativo = st.sidebar.toggle("🤖 Robô Multiativos Automático", value=saved_robo)
-if robo_ativo != saved_robo:
-    set_setting("robo_ativo", str(robo_ativo))
+default_robo = load_setting("robo_ativo", "True") == "True"
+robo_ativo = st.sidebar.toggle("🤖 Robô de Execução Automática (22 Ativos)", value=default_robo)
+save_setting("robo_ativo", str(robo_ativo))
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("💼 Simulação de Banca")
+st.sidebar.subheader("💼 Simulação no Fracionário")
 balance_atual, pnl_total_acumulado = get_account_info()
 st.sidebar.metric("Saldo Disponível", f"R$ {balance_atual:,.2f}")
 st.sidebar.metric("PnL Total Acumulado", f"R$ {pnl_total_acumulado:,.2f}")
@@ -217,13 +228,13 @@ if st.sidebar.button("🔄 Resetar Simulação (R$ 1.000,00)"):
 st.sidebar.markdown("---")
 st.sidebar.info(
     f"📌 **Ativo Exibido**: `{ticker_frac}`\n\n"
-    f"🌐 **Scanner**: Monitorando 22 Ativos da B3\n\n"
+    f"🌐 **Varredura**: 22 Ativos da B3\n\n"
     f"🔄 **Auto-Refresh**: 5 minutos\n\n"
     f"⏱️ **Hora Atual**: {datetime.now().strftime('%H:%M:%S')}"
 )
 
 # ============================================================
-# COLETA E PROCESSAMENTO DOS DADOS (YFINANCE)
+# COLETA DE DADOS COM CACHE
 # ============================================================
 intervalo_yf = "5m" if "5m" in timeframe else "1d"
 periodo_yf = "5d" if "5m" in timeframe else "6mo"
@@ -236,10 +247,17 @@ def carregar_dados_b3(symbol, period, interval):
         if df is None or df.empty:
             return pd.DataFrame()
         return df
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
-def calcular_indicadores(df_raw, modo):
+# ============================================================
+# CÁLCULO QUANTITATIVO DE UM ATIVO
+# ============================================================
+def calcular_metricas_ativo(symbol):
+    df_raw = carregar_dados_b3(symbol, periodo_yf, intervalo_yf)
+    if df_raw.empty:
+        return None
+    
     df = df_raw.copy()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
@@ -265,263 +283,364 @@ def calcular_indicadores(df_raw, modo):
     
     regime = "ALTA 🟢" if ema20 > ema50 else "BAIXA 🔴"
     
-    if "First Touch" in modo:
-        dist_call = abs(preco_atual - call_wall)
-        dist_put = abs(preco_atual - put_wall)
+    # Níveis de First Touch
+    ft_superior = call_wall
+    ft_inferior = put_wall
+    dist_ft_superior = call_wall - preco_atual
+    dist_ft_inferior = preco_atual - put_wall
+    
+    # Lógica conforme estratégia
+    if "First Touch" in modo_alvo:
+        dist_call_pct = (call_wall - preco_atual) / preco_atual
+        dist_put_pct = (preco_atual - put_wall) / preco_atual
         
-        if dist_call <= (preco_atual * 0.003):
-            sinal = "VENDA (FIRST TOUCH) 🔴"
-            entry = preco_atual
-            alvo_tp = entry - (entry * 0.015)
-            stop_sl = entry + (entry * 0.0075)
-            diag = f"Primeiro Toque na Call Wall (R$ {call_wall:.2f}). Reversão de volatilidade esperada."
-        elif dist_put <= (preco_atual * 0.003):
-            sinal = "COMPRA (FIRST TOUCH) 🟢"
-            entry = preco_atual
-            alvo_tp = entry + (entry * 0.015)
-            stop_sl = entry - (entry * 0.0075)
-            diag = f"Primeiro Toque na Put Wall (R$ {put_wall:.2f}). Repique de suporte esperado."
+        if dist_call_pct <= 0.003 and dist_call_pct >= -0.003:
+            sinal = "COMPRA (FIRST TOUCH CALL WALL) 🟢"
+            preco_entrada_ref = preco_atual
+            alvo_tp = preco_entrada_ref + (preco_entrada_ref * 0.01)
+            stop_sl = preco_entrada_ref - (preco_entrada_ref * 0.005)
+            diagnostico = f"🎯 **FIRST TOUCH DETECTADO**: Preço R$ {preco_atual:.2f} encostou na Call Wall (R$ {call_wall:.2f})."
+        elif dist_put_pct <= 0.003 and dist_put_pct >= -0.003:
+            sinal = "VENDA (FIRST TOUCH PUT WALL) 🔴"
+            preco_entrada_ref = preco_atual
+            alvo_tp = preco_entrada_ref - (preco_entrada_ref * 0.01)
+            stop_sl = preco_entrada_ref + (preco_entrada_ref * 0.005)
+            diagnostico = f"🎯 **FIRST TOUCH DETECTADO**: Preço R$ {preco_atual:.2f} encostou na Put Wall (R$ {put_wall:.2f})."
         else:
             sinal = "AGUARDAR 🟡"
-            entry = preco_atual
-            alvo_tp = entry * 1.015
-            stop_sl = entry * 0.9925
-            diag = f"Preço R$ {preco_atual:.2f} aguardando aproximação da Call Wall (R$ {call_wall:.2f}) ou Put Wall (R$ {put_wall:.2f})."
-    else:
-        entry = preco_atual
-        if "1.5%" in modo:
-            dist_alvo = entry * 0.015
-            dist_stop = entry * 0.0075
-        else:
-            dist_alvo = atr * 2.0
-            dist_stop = atr * 1.0
+            preco_entrada_ref = preco_atual
+            alvo_tp = preco_atual * 1.015
+            stop_sl = preco_atual * 0.9925
+            diagnostico = f"Aguardando toque na parede: Call Wall em R$ {call_wall:.2f} (a R$ {dist_ft_superior:+.2f}) | Put Wall em R$ {put_wall:.2f} (a R$ -{dist_ft_inferior:.2f})."
             
+    elif "ATR" in modo_alvo:
+        preco_entrada_ref = preco_atual
+        distancia_alvo = atr * 2.0
+        distancia_stop = atr * 1.0
         if regime == "ALTA 🟢":
-            alvo_tp = entry + dist_alvo
-            stop_sl = entry - dist_stop
+            alvo_tp = preco_entrada_ref + distancia_alvo
+            stop_sl = preco_entrada_ref - distancia_stop
+            tem_espaco = alvo_tp <= call_wall
+            if tem_espaco:
+                sinal = "COMPRA (LONG ATR) 🟢"
+                diagnostico = f"Entrada R$ {preco_entrada_ref:.2f} (ATR 2.0x). Espaço livre até a Call Wall: R$ {call_wall - alvo_tp:.2f}."
+            else:
+                sinal = "AGUARDAR 🟡"
+                diagnostico = f"Bloqueado: Alvo ATR R$ {alvo_tp:.2f} colide com a Call Wall (R$ {call_wall:.2f})."
+        else:
+            alvo_tp = preco_entrada_ref - distancia_alvo
+            stop_sl = preco_entrada_ref + distancia_stop
+            tem_espaco = alvo_tp >= put_wall
+            if tem_espaco:
+                sinal = "VENDA (SHORT ATR) 🔴"
+                diagnostico = f"Entrada R$ {preco_entrada_ref:.2f} (ATR 2.0x). Espaço livre acima da Put Wall: R$ {alvo_tp - put_wall:.2f}."
+            else:
+                sinal = "AGUARDAR 🟡"
+                diagnostico = f"Bloqueado: Alvo ATR R$ {alvo_tp:.2f} colide com a Put Wall (R$ {put_wall:.2f})."
+    else:
+        # Estratégia G — Expansão de Abertura (1.5%)
+        preco_entrada_ref = preco_abertura
+        distancia_alvo = preco_abertura * 0.015
+        distancia_stop = preco_abertura * 0.0075
+        
+        if regime == "ALTA 🟢":
+            alvo_tp = preco_abertura + distancia_alvo
+            stop_sl = preco_abertura - distancia_stop
             tem_espaco = alvo_tp <= call_wall
             if tem_espaco:
                 sinal = "COMPRA (LONG) 🟢"
-                diag = f"Entrada ao preço atual R$ {entry:.2f} (Tendência de Alta). Espaço livre de R$ {call_wall - alvo_tp:.2f} antes do teto."
+                diagnostico = f"Entrada em R$ {preco_abertura:.2f} com tendência de alta. Espaço livre de R$ {call_wall - alvo_tp:.2f} antes da Call Wall (R$ {call_wall:.2f})."
             else:
                 sinal = "AGUARDAR 🟡"
-                diag = f"Bloqueado: Alvo R$ {alvo_tp:.2f} colide com a Call Wall (R$ {call_wall:.2f})."
+                diagnostico = f"Bloqueado: Alvo R$ {alvo_tp:.2f} colide com a Call Wall (R$ {call_wall:.2f})."
         else:
-            alvo_tp = entry - dist_alvo
-            stop_sl = entry + dist_stop
+            alvo_tp = preco_abertura - distancia_alvo
+            stop_sl = preco_abertura + distancia_stop
             tem_espaco = alvo_tp >= put_wall
             if tem_espaco:
                 sinal = "VENDA (SHORT) 🔴"
-                diag = f"Entrada ao preço atual R$ {entry:.2f} (Tendência de Baixa). Espaço livre de R$ {alvo_tp - put_wall:.2f} até o piso."
+                diagnostico = f"Entrada em R$ {preco_abertura:.2f} com tendência de baixa. Espaço livre de R$ {alvo_tp - put_wall:.2f} acima da Put Wall (R$ {put_wall:.2f})."
             else:
                 sinal = "AGUARDAR 🟡"
-                diag = f"Bloqueado: Alvo R$ {alvo_tp:.2f} colide com a Put Wall (R$ {put_wall:.2f})."
+                diagnostico = f"Bloqueado: Alvo R$ {alvo_tp:.2f} colide com a Put Wall (R$ {put_wall:.2f})."
 
     return {
-        "df": df, "preco_atual": preco_atual, "high_atual": high_atual, "low_atual": low_atual,
-        "preco_abertura": preco_abertura, "call_wall": call_wall, "put_wall": put_wall,
-        "atr": atr, "regime": regime, "sinal": sinal, "entry": entry,
-        "alvo_tp": alvo_tp, "stop_sl": stop_sl, "diagnostico": diag
+        "df": df,
+        "preco_atual": preco_atual,
+        "high_atual": high_atual,
+        "low_atual": low_atual,
+        "preco_abertura": preco_abertura,
+        "preco_entrada_ref": preco_entrada_ref,
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "atr": atr,
+        "regime": regime,
+        "alvo_tp": alvo_tp,
+        "stop_sl": stop_sl,
+        "sinal": sinal,
+        "diagnostico": diagnostico,
+        "ft_superior": ft_superior,
+        "ft_inferior": ft_inferior,
+        "dist_ft_superior": dist_ft_superior,
+        "dist_ft_inferior": dist_ft_inferior,
     }
 
 # ============================================================
-# SCANNER MULTIATIVOS E MOTOR DE EXECUÇÃO
+# MOTOR DE SCANNER AUTOMÁTICO DE 22 ATIVOS
 # ============================================================
-def executar_robo_multiativos():
-    if not robo_ativo:
-        return
-        
+def executar_scanner_multiativos():
     conn = get_conn()
     cursor = conn.cursor()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hoje_str = datetime.now().strftime("%Y-%m-%d")
     
-    balance, pnl_tot = get_account_info()
-    
-    # 1. Monitora e encerra posições ABERTAS existentes
+    # 1. Verifica fechamento de posições abertas
     cursor.execute("SELECT id, ticker, ticker_frac, side, entry_price, stop_price, target_price, qty, invested FROM trades WHERE status = 'ABERTA'")
     trades_abertos = cursor.fetchall()
     
     for t in trades_abertos:
         t_id, t_sym, t_frac, t_side, t_entry, t_stop, t_target, t_qty, t_invested = t
-        df_t = carregar_dados_b3(t_sym, "1d", "5m")
-        if df_t.empty:
+        m = calcular_metricas_ativo(t_sym)
+        if not m:
             continue
-        p_atual = float(df_t["Close"].iloc[-1])
-        h_atual = float(df_t["High"].iloc[-1])
-        l_atual = float(df_t["Low"].iloc[-1])
         
+        p_atual = m["preco_atual"]
+        h_atual = m["high_atual"]
+        l_atual = m["low_atual"]
         fechou = False
         exit_reason = ""
         exit_price = p_atual
+        pnl_brl = 0.0
         
         if t_side == "COMPRA":
             if h_atual >= t_target or p_atual >= t_target:
                 fechou = True
                 exit_reason = "FECHADA_TP"
                 exit_price = t_target
+                pnl_brl = (t_target - t_entry) * t_qty
             elif l_atual <= t_stop or p_atual <= t_stop:
                 fechou = True
                 exit_reason = "FECHADA_SL"
                 exit_price = t_stop
+                pnl_brl = (t_stop - t_entry) * t_qty
         else:
             if l_atual <= t_target or p_atual <= t_target:
                 fechou = True
                 exit_reason = "FECHADA_TP"
                 exit_price = t_target
+                pnl_brl = (t_entry - t_target) * t_qty
             elif h_atual >= t_stop or p_atual >= t_stop:
                 fechou = True
                 exit_reason = "FECHADA_SL"
                 exit_price = t_stop
+                pnl_brl = (t_entry - t_stop) * t_qty
                 
         if fechou:
-            pnl_brl = (exit_price - t_entry) * t_qty if t_side == "COMPRA" else (t_entry - exit_price) * t_qty
             pnl_pct = (pnl_brl / t_invested) * 100 if t_invested > 0 else 0.0
-            
             cursor.execute("""
                 UPDATE trades 
                 SET exit_time = ?, exit_price = ?, pnl_brl = ?, pnl_pct = ?, status = ?, exit_reason = ?
                 WHERE id = ?
             """, (now_str, exit_price, pnl_brl, pnl_pct, exit_reason, exit_reason, t_id))
             
-            novo_saldo = balance + t_invested + pnl_brl
+            bal, _ = get_account_info()
+            novo_saldo = bal + t_invested + pnl_brl
             cursor.execute("UPDATE account SET balance = ?, pnl_total = pnl_total + ? WHERE id = 1", (novo_saldo, pnl_brl))
             conn.commit()
-            balance = novo_saldo
-            st.toast(f"🎯 **Robô Encerrou {t_frac} ({exit_reason})**: PnL R$ {pnl_brl:+.2f} ({pnl_pct:+.2f}%)", icon="💰")
+            st.toast(f"🎯 **POSIÇÃO ENCERRADA ({exit_reason})**: {t_frac} | PnL: R$ {pnl_brl:+.2f} ({pnl_pct:+.2f}%)", icon="🎉")
 
-    # 2. Scanner por novas oportunidades nos 22 ativos
-    for symbol in LISTA_TICKERS:
-        # Trava: máx 1 trade por ativo por dia
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE ticker = ? AND entry_time LIKE ?", (symbol, f"{hoje_str}%"))
-        if cursor.fetchone()[0] >= 1:
-            continue
-            
-        # Verifica se já tem posição aberta para este ativo
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE ticker = ? AND status = 'ABERTA'", (symbol,))
-        if cursor.fetchone()[0] >= 1:
-            continue
-            
-        df_scan = carregar_dados_b3(symbol, "5d", "5m")
-        if df_scan.empty:
-            continue
-            
-        res = calcular_indicadores(df_scan, modo_alvo)
-        sinal = res["sinal"]
+    # 2. Varredura para novas entradas se o robô estiver ativo
+    if robo_ativo:
+        bal_disponivel, _ = get_account_info()
         
-        if "COMPRA" in sinal or "VENDA" in sinal:
-            p_entry = res["entry"]
-            sym_frac = obter_ticker_fracionario(symbol)
-            qtd_frac = int(balance // p_entry)
-            
-            if qtd_frac >= 1:
-                v_investido = qtd_frac * p_entry
-                side = "COMPRA" if "COMPRA" in sinal else "VENDA"
+        for sym in LISTA_ATIVOS:
+            if bal_disponivel < 10.0:
+                break
                 
-                cursor.execute("""
-                    INSERT INTO trades 
-                    (ticker, ticker_frac, side, entry_time, entry_price, stop_price, target_price, qty, invested, status, strategy)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ABERTA', ?)
-                """, (symbol, sym_frac, side, now_str, p_entry, res["stop_sl"], res["alvo_tp"], qtd_frac, v_investido, modo_alvo))
+            # Trava 1 trade por ativo por dia
+            cursor.execute("SELECT COUNT(*) FROM trades WHERE ticker = ? AND entry_time LIKE ?", (sym, f"{hoje_str}%"))
+            if cursor.fetchone()[0] >= 1:
+                continue
                 
-                novo_saldo = balance - v_investido
-                cursor.execute("UPDATE account SET balance = ? WHERE id = 1", (novo_saldo,))
-                conn.commit()
-                balance = novo_saldo
-                st.toast(f"🚀 **Entrada Automática**: {side} {qtd_frac}x `{sym_frac}` a R$ {p_entry:.2f}", icon="📈")
+            m = calcular_metricas_ativo(sym)
+            if not m:
+                continue
+                
+            sinal = m["sinal"]
+            if "COMPRA" in sinal or "VENDA" in sinal:
+                p_entrada = m["preco_atual"] # Preço atual em tempo real
+                t_frac = obter_ticker_fracionario(sym)
+                qtd_frac = int(bal_disponivel // p_entrada)
+                
+                if qtd_frac >= 1:
+                    valor_inv = qtd_frac * p_entrada
+                    side = "COMPRA" if "COMPRA" in sinal else "VENDA"
+                    
+                    cursor.execute("""
+                        INSERT INTO trades 
+                        (ticker, ticker_frac, side, entry_time, entry_price, stop_price, target_price, qty, invested, status, strategy)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ABERTA', ?)
+                    """, (sym, t_frac, side, now_str, p_entrada, m["stop_sl"], m["alvo_tp"], qtd_frac, valor_inv, modo_alvo))
+                    
+                    bal_disponivel -= valor_inv
+                    cursor.execute("UPDATE account SET balance = ? WHERE id = 1", (bal_disponivel,))
+                    conn.commit()
+                    st.toast(f"🤖 **ROBÔ COMPROU NO FRACIONÁRIO**: {side} de {qtd_frac} x {t_frac} a R$ {p_entrada:.2f}", icon="🚀")
 
     conn.close()
 
-executar_robo_multiativos()
+executar_scanner_multiativos()
+
+# Recarrega métricas
+balance_atual, pnl_total_acumulado = get_account_info()
+m_sel = calcular_metricas_ativo(ticker_selecionado)
 
 # ============================================================
-# EXIBIÇÃO NO PAINEL PRINCIPAL
+# CABEÇALHO E MÉTRICAS
 # ============================================================
-df_raw_main = carregar_dados_b3(ticker_selecionado, periodo_yf, intervalo_yf)
-
-if df_raw_main.empty:
-    st.warning(f"Aguardando dados para {ticker_selecionado} ({ticker_frac}). Verifique a conexão com a B3.")
-    st.stop()
-
-data_main = calcular_indicadores(df_raw_main, modo_alvo)
-
 st.title(f"📊 B3 Quant Monitor — {ticker_selecionado} ({ticker_frac})")
 st.caption(f"Varredura Automática de 22 Ativos • {modo_alvo} • Atualizado às {datetime.now().strftime('%H:%M:%S')}")
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Preço Atual", f"R$ {data_main['preco_atual']:,.2f}")
-m2.metric("Abertura (Âncora)", f"R$ {data_main['preco_abertura']:,.2f}")
-m3.metric("Call Wall (Teto)", f"R$ {data_main['call_wall']:,.2f}", f"Dist: R$ {data_main['call_wall'] - data_main['preco_atual']:+.2f}")
-m4.metric("Put Wall (Piso)", f"R$ {data_main['put_wall']:,.2f}", f"Dist: R$ {data_main['preco_atual'] - data_main['put_wall']:+.2f}")
-m5.metric("Regime EMA", data_main["regime"])
+if m_sel:
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Preço Atual", f"R$ {m_sel['preco_atual']:,.2f}")
+    m2.metric("Abertura (Âncora)", f"R$ {m_sel['preco_abertura']:,.2f}")
+    m3.metric("Call Wall (Teto)", f"R$ {m_sel['call_wall']:,.2f}", f"Dist: R$ {m_sel['call_wall'] - m_sel['preco_atual']:+.2f}")
+    m4.metric("Put Wall (Piso)", f"R$ {m_sel['put_wall']:,.2f}", f"Dist: R$ {m_sel['preco_atual'] - m_sel['put_wall']:+.2f}")
+    m5.metric("Regime EMA", m_sel['regime'])
 
-cor_card = "#1e3a29" if "COMPRA" in data_main["sinal"] else ("#3a1e1e" if "VENDA" in data_main["sinal"] else "#3a321e")
-st.markdown(
-    f"""
-    <div class="status-card" style="background-color: {cor_card};">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-            <h3 style="margin:0; padding:0;">Sinal no Painel: {data_main['sinal']}</h3>
-            <span class="badge-frac">LOTE FRACIONÁRIO: {ticker_frac}</span>
+    cor_card = "#1e3a29" if "COMPRA" in m_sel['sinal'] else ("#3a1e1e" if "VENDA" in m_sel['sinal'] else "#3a321e")
+    
+    st.markdown(
+        f"""
+        <div class="status-card" style="background-color: {cor_card};">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3 style="margin:0; padding:0;">Sinal no Painel: {m_sel['sinal']}</h3>
+                <span class="badge-frac">LOTE FRACIONÁRIO: {ticker_frac}</span>
+            </div>
+            <p style="margin-top:0.5rem; margin-bottom:0; font-size: 1.05rem;"><b>Diagnóstico:</b> {m_sel['diagnostico']}</p>
+            <p style="margin-top:0.3rem; margin-bottom:0; font-size: 0.95rem; color: #d0d0d0;">
+                <b>Plano de Ação:</b> Entrada R$ {m_sel['preco_entrada_ref']:,.2f} | Alvo (TP): R$ {m_sel['alvo_tp']:,.2f} | Stop (SL): R$ {m_sel['stop_sl']:,.2f} | R/R 1:2
+            </p>
+            <div class="ft-box">
+                🎯 <b>Níveis de First Touch (GEX Walls)</b>:<br/>
+                • <b>First Touch Superior (Call Wall)</b>: <b>R$ {m_sel['ft_superior']:,.2f}</b> (Distância Atual: R$ {m_sel['dist_ft_superior']:+.2f})<br/>
+                • <b>First Touch Inferior (Put Wall)</b>: <b>R$ {m_sel['ft_inferior']:,.2f}</b> (Distância Atual: R$ -{m_sel['dist_ft_inferior']:.2f})
+            </div>
         </div>
-        <p style="margin-top:0.5rem; margin-bottom:0; font-size: 1.05rem;"><b>Diagnóstico:</b> {data_main['diagnostico']}</p>
-        <p style="margin-top:0.3rem; margin-bottom:0; font-size: 0.95rem; color: #d0d0d0;">
-            <b>Plano de Ação:</b> Entrada R$ {data_main['entry']:,.2f} | Alvo (TP): R$ {data_main['alvo_tp']:,.2f} | Stop (SL): R$ {data_main['stop_sl']:,.2f} | R/R 1:2
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+        """,
+        unsafe_allow_html=True,
+    )
 
-# Gráfico Plotly
-fig = go.Figure()
-fig.add_trace(go.Candlestick(
-    x=data_main["df"].index, open=data_main["df"]["Open"], high=data_main["df"]["High"],
-    low=data_main["df"]["Low"], close=data_main["df"]["Close"], name=f"Preço {ticker_frac}",
-    increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
-))
-fig.add_trace(go.Scatter(x=data_main["df"].index, y=data_main["df"]["Call_Wall"], name="Call Wall (Resistência)", line=dict(color="#ff5252", width=2)))
-fig.add_trace(go.Scatter(x=data_main["df"].index, y=data_main["df"]["Put_Wall"], name="Put Wall (Suporte)", line=dict(color="#00e676", width=2)))
+    # ============================================================
+    # GRÁFICO INTERATIVO PLOTLY
+    # ============================================================
+    df = m_sel["df"]
+    fig = go.Figure()
 
-fig.add_hline(y=data_main["entry"], line_dash="dash", line_color="#29b6f6", annotation_text=f"Entrada: R$ {data_main['entry']:.2f}")
-fig.add_hline(y=data_main["alvo_tp"], line_dash="dot", line_color="#00e676", annotation_text=f"Alvo TP: R$ {data_main['alvo_tp']:.2f}")
-fig.add_hline(y=data_main["stop_sl"], line_dash="dot", line_color="#ff1744", annotation_text=f"Stop SL: R$ {data_main['stop_sl']:.2f}")
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name=f"Preço {ticker_frac}",
+            increasing_line_color="#26a69a",
+            decreasing_line_color="#ef5350",
+        )
+    )
 
-fig.update_layout(
-    title=f"Gráfico de Preço e Paredes de Liquidez (Donchian) — {ticker_frac}",
-    yaxis_title="Preço (R$)", template="plotly_dark", height=500, xaxis_rangeslider_visible=False
-)
-st.plotly_chart(fig, use_container_width=True)
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["Call_Wall"],
+            name="Call Wall (First Touch Superior)",
+            line=dict(color="#ff5252", width=2, dash="solid"),
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["Put_Wall"],
+            name="Put Wall (First Touch Inferior)",
+            line=dict(color="#00e676", width=2, dash="solid"),
+        )
+    )
+
+    fig.add_hline(
+        y=m_sel["preco_abertura"],
+        line_dash="dash",
+        line_color="#29b6f6",
+        annotation_text=f"Abertura: R$ {m_sel['preco_abertura']:.2f}",
+        annotation_position="bottom right",
+    )
+
+    fig.add_hline(
+        y=m_sel["alvo_tp"],
+        line_dash="dot",
+        line_color="#00e676" if "COMPRA" in m_sel["sinal"] else "#ff5252",
+        annotation_text=f"Alvo TP: R$ {m_sel['alvo_tp']:.2f}",
+        annotation_position="top right",
+    )
+
+    fig.add_hline(
+        y=m_sel["stop_sl"],
+        line_dash="dot",
+        line_color="#ff1744",
+        annotation_text=f"Stop SL: R$ {m_sel['stop_sl']:.2f}",
+        annotation_position="bottom right",
+    )
+
+    fig.update_layout(
+        title=f"Gráfico de Preço e Paredes de Liquidez (Donchian GEX) — {ticker_frac}",
+        yaxis_title="Preço (R$)",
+        template="plotly_dark",
+        height=550,
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
-# PAINEL DE PAPER TRADING & HISTÓRICO EM PORTUGUÊS
+# PAINEL DE PAPER TRADING & BANCO DE DADOS SQLITE
 # ============================================================
 st.markdown("---")
 st.subheader("📜 Gestão de Ordens no Simulador (Paper Trading - SQLite)")
 
-tab1, tab2 = st.tabs(["📌 Posições Abertas (Todas as Ações)", "🏛️ Histórico Completo de Operações"])
+tab1, tab2 = st.tabs(["📌 Posição Aberta", "🏛️ Histórico Completo de Operações"])
 
 conn = get_conn()
 
 with tab1:
     cursor = conn.cursor()
-    cursor.execute("SELECT id, ticker_frac, side, entry_time, entry_price, stop_price, target_price, qty, invested, strategy FROM trades WHERE status = 'ABERTA'")
+    cursor.execute("""
+        SELECT id, ticker, ticker_frac, side, entry_time, entry_price, stop_price, target_price, qty, invested 
+        FROM trades 
+        WHERE status = 'ABERTA'
+    """)
     abertas = cursor.fetchall()
     
     if abertas:
         for trade in abertas:
-            tid, t_frac, t_side, t_time, t_entry, t_stop, t_target, t_qty, t_invest, t_strat = trade
-            df_curr = carregar_dados_b3(t_frac.replace("F.SA", ".SA"), "1d", "5m")
-            p_agora = float(df_curr["Close"].iloc[-1]) if not df_curr.empty else t_entry
+            tid, t_sym, t_frac, t_side, t_time, t_entry, t_stop, t_target, t_qty, t_invest = trade
+            m_trade = calcular_metricas_ativo(t_sym)
+            p_agora = m_trade["preco_atual"] if m_trade else t_entry
             
-            pnl_brl = (p_agora - t_entry) * t_qty if t_side == "COMPRA" else (t_entry - p_agora) * t_qty
-            pnl_pct = (pnl_brl / t_invest) * 100 if t_invest > 0 else 0
+            if t_side == "COMPRA":
+                pnl_atual_brl = (p_agora - t_entry) * t_qty
+            else:
+                pnl_atual_brl = (t_entry - p_agora) * t_qty
+            pnl_atual_pct = (pnl_atual_brl / t_invest) * 100 if t_invest > 0 else 0
             
             c1, c2, c3, c4, c5, c6 = st.columns([1.5, 1, 1, 1.2, 1.2, 1])
-            c1.markdown(f"**{t_frac}** ({t_side})<br><small>{t_strat}</small>", unsafe_allow_html=True)
+            c1.markdown(f"**{t_frac}** ({t_side})")
             c2.write(f"Qtd: **{t_qty}** ações")
             c3.write(f"Entrada: R$ {t_entry:.2f}")
             c4.write(f"Alvo TP: R$ {t_target:.2f}")
-            c5.markdown(f"PnL Atual: **R$ {pnl_brl:+.2f} ({pnl_pct:+.2f}%)**")
+            c5.markdown(f"PnL Atual: **R$ {pnl_atual_brl:+.2f} ({pnl_atual_pct:+.2f}%)**")
             
             if c6.button("Fechar Manual", key=f"close_{tid}"):
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -529,40 +648,49 @@ with tab1:
                     UPDATE trades 
                     SET exit_time = ?, exit_price = ?, pnl_brl = ?, pnl_pct = ?, status = 'FECHADA_MANUAL', exit_reason = 'MANUAL'
                     WHERE id = ?
-                """, (now_str, p_agora, pnl_brl, pnl_pct, tid))
+                """, (now_str, p_agora, pnl_atual_brl, pnl_atual_pct, tid))
                 
-                novo_bal = balance_atual + t_invest + pnl_brl
-                cursor.execute("UPDATE account SET balance = ?, pnl_total = pnl_total + ? WHERE id = 1", (novo_bal, pnl_brl))
+                novo_saldo = balance_atual + t_invest + pnl_atual_brl
+                cursor.execute("UPDATE account SET balance = ?, pnl_total = pnl_total + ? WHERE id = 1", (novo_saldo, pnl_atual_brl))
                 conn.commit()
                 st.success(f"Posição em {t_frac} encerrada manualmente!")
                 st.rerun()
     else:
-        st.info("Nenhuma posição aberta no momento. O Scanner Multiativos está varrendo as 22 ações da B3.")
+        st.info("Nenhuma posição aberta no momento. O Robô Automático está varrendo os 22 ativos aguardando sinais.")
 
 with tab2:
-    df_trades = pd.read_sql_query("SELECT id, ticker_frac, side, entry_time, entry_price, stop_price, target_price, qty, invested, exit_time, exit_price, pnl_brl, pnl_pct, status, strategy FROM trades ORDER BY id DESC", conn)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            id AS "ID",
+            ticker_frac AS "Lote Fracionário",
+            side AS "Operação",
+            entry_time AS "Data/Hora Entrada",
+            printf('R$ %.2f', entry_price) AS "Preço Entrada",
+            printf('R$ %.2f', target_price) AS "Alvo (TP)",
+            printf('R$ %.2f', stop_price) AS "Stop (SL)",
+            qty AS "Qtd Ações",
+            printf('R$ %.2f', invested) AS "Valor Investido",
+            exit_time AS "Data/Hora Saída",
+            printf('R$ %.2f', exit_price) AS "Preço Saída",
+            printf('R$ %+.2f', pnl_brl) AS "Resultado (R$)",
+            printf('%+.2f%%', pnl_pct) AS "Retorno (%)",
+            CASE 
+                WHEN status = 'ABERTA' THEN 'Em Andamento ⏳'
+                WHEN status = 'FECHADA_TP' THEN 'Fechada (Lucro TP) 🎯'
+                WHEN status = 'FECHADA_SL' THEN 'Fechada (Stop Loss) 🛑'
+                ELSE status
+            END AS "Situação",
+            strategy AS "Estratégia"
+        FROM trades 
+        ORDER BY id DESC
+    """)
+    rows = cursor.fetchall()
+    cols = [desc[0] for desc in cursor.description]
     
-    if not df_trades.empty:
-        # Renomeia colunas para Português
-        colunas_pt = {
-            "id": "ID",
-            "ticker_frac": "Lote Fracionário",
-            "side": "Operação",
-            "entry_time": "Data/Hora Entrada",
-            "entry_price": "Preço Entrada (R$)",
-            "stop_price": "Stop Loss (R$)",
-            "target_price": "Alvo TP (R$)",
-            "qty": "Qtd Ações",
-            "invested": "Investido (R$)",
-            "exit_time": "Data/Hora Saída",
-            "exit_price": "Preço Saída (R$)",
-            "pnl_brl": "Resultado (R$)",
-            "pnl_pct": "Resultado (%)",
-            "status": "Situação",
-            "strategy": "Método Operacional"
-        }
-        df_trades.rename(columns=colunas_pt, inplace=True)
-        st.dataframe(df_trades, use_container_width=True)
+    if rows:
+        df_hist = pd.DataFrame(rows, columns=cols)
+        st.dataframe(df_hist, use_container_width=True)
     else:
         st.write("Nenhum histórico registrado no banco de dados.")
 
