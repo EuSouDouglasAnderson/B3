@@ -80,13 +80,6 @@ def init_db():
             strategy TEXT DEFAULT 'GEX_B3_AUTOMATICO'
         )
     """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS bot_state (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            last_signal TEXT DEFAULT 'AGUARDAR'
-        )
-    """)
-    cursor.execute("INSERT OR IGNORE INTO bot_state (id, last_signal) VALUES (1, 'AGUARDAR')")
     cursor.execute("SELECT COUNT(*) FROM account")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO account (balance, pnl_total) VALUES (100.0, 0.0)")
@@ -120,7 +113,6 @@ def reset_db(initial_capital=100.0):
     cursor = conn.cursor()
     cursor.execute("DELETE FROM trades")
     cursor.execute("UPDATE account SET balance = ?, pnl_total = 0.0 WHERE id = 1", (initial_capital,))
-    cursor.execute("UPDATE bot_state SET last_signal = 'AGUARDAR' WHERE id = 1")
     conn.commit()
     conn.close()
 
@@ -137,7 +129,7 @@ def obter_ticker_fracionario(symbol):
 # ============================================================
 # AUTO-REFRESH DE 5 MINUTOS (300 SEGUNDOS)
 # ============================================================
-REFRESH_INTERVAL_SEC = 300
+REFRESH_INTERVAL_SEC = 60
 st.components.v1.html(
     f"""
     <script>
@@ -153,6 +145,8 @@ st.components.v1.html(
 # SIDEBAR - PARÂMETROS
 # ============================================================
 st.sidebar.title("⚙️ Configurações B3 Quant")
+
+max_operacoes = st.sidebar.slider("Máximo de operações simultâneas", min_value=1, max_value=50, value=20, step=1)
 
 ticker_selecionado = st.sidebar.selectbox(
     "Selecione o Ativo:",
@@ -191,8 +185,7 @@ st.sidebar.markdown("---")
 st.sidebar.info(
     f"📌 **Mercado Fracionário**: `{ticker_frac}`\n\n"
     f"🔄 **Auto-Refresh**: 5 minutos\n\n"
-    f"⏱️ **Hora Atual**: {datetime.now().strftime('%H:%M:%S')}\n\n"
-    f"🛡️ **Proteção**: 1 entrada por transição de sinal"
+    f"⏱️ **Hora Atual**: {datetime.now().strftime('%H:%M:%S')}"
 )
 
 # ============================================================
@@ -286,50 +279,34 @@ else:
         sinal = "AGUARDAR 🟡"
         diagnostico = f"Bloqueado: Alvo R$ {alvo_tp:.2f} ultrapassa a Put Wall (R$ {put_wall:.2f}). Espaço livre insuficiente para o risco."
 
-def get_last_bot_signal():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT last_signal FROM bot_state WHERE id = 1")
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else "AGUARDAR"
-
-
-def set_last_bot_signal(signal_value):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE bot_state SET last_signal = ? WHERE id = 1", (signal_value,))
-    conn.commit()
-    conn.close()
-
-
 # ============================================================
 # MOTOR DE EXECUÇÃO AUTOMÁTICA (ROBÔ SQLITE)
 # ============================================================
 def processar_robo_automatico():
+    """Monitora todas as posições abertas e permite múltiplas posições simultâneas."""
     conn = get_conn()
     cursor = conn.cursor()
-    ultimo_sinal = get_last_bot_signal()
-    
-    # 1. Verifica se já existe trade ABERTO para este ticker
-    cursor.execute("""
-        SELECT id, side, entry_price, stop_price, target_price, qty, invested 
-        FROM trades 
-        WHERE ticker = ? AND status = 'ABERTA'
-    """, (ticker_selecionado,))
-    trade_aberto = cursor.fetchone()
-    
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    if trade_aberto:
-        t_id, t_side, t_entry, t_stop, t_target, t_qty, t_invested = trade_aberto
-        
-        # Monitora fechamento automático por Take Profit ou Stop Loss
+
+    # 1) Monitora TODAS as posições abertas do ticker.
+    cursor.execute("""
+        SELECT id, side, entry_price, stop_price, target_price, qty, invested
+        FROM trades
+        WHERE ticker = ? AND status = 'ABERTA'
+        ORDER BY id ASC
+    """, (ticker_selecionado,))
+    trades_abertos = cursor.fetchall()
+
+    fechou_alguma = False
+    mensagens = []
+
+    for trade in trades_abertos:
+        t_id, t_side, t_entry, t_stop, t_target, t_qty, t_invested = trade
         fechou = False
         exit_reason = ""
         exit_price = preco_atual
         pnl_brl = 0.0
-        
+
         if t_side == "COMPRA":
             if high_atual >= t_target or preco_atual >= t_target:
                 fechou = True
@@ -341,7 +318,7 @@ def processar_robo_automatico():
                 exit_reason = "FECHADA_SL"
                 exit_price = t_stop
                 pnl_brl = (t_stop - t_entry) * t_qty
-        else: # VENDA (SHORT)
+        else:
             if low_atual <= t_target or preco_atual <= t_target:
                 fechou = True
                 exit_reason = "FECHADA_TP"
@@ -352,66 +329,93 @@ def processar_robo_automatico():
                 exit_reason = "FECHADA_SL"
                 exit_price = t_stop
                 pnl_brl = (t_entry - t_stop) * t_qty
-                
+
         if fechou:
             pnl_pct = (pnl_brl / t_invested) * 100 if t_invested > 0 else 0.0
             cursor.execute("""
-                UPDATE trades 
-                SET exit_time = ?, exit_price = ?, pnl_brl = ?, pnl_pct = ?, status = ?, exit_reason = ?
-                WHERE id = ?
-            """, (now_str, exit_price, pnl_brl, pnl_pct, exit_reason, exit_reason, t_id))
-            
-            # Devolve o valor investido + lucro/prejuízo ao saldo
-            novo_saldo = balance_atual + t_invested + pnl_brl
-            cursor.execute("UPDATE account SET balance = ?, pnl_total = pnl_total + ? WHERE id = 1", (novo_saldo, pnl_brl))
-            conn.commit()
-            
-            if "TP" in exit_reason:
-                st.balloons()
-                st.success(f"🎯 **ROBÔ ENCERROU POSIÇÃO NO ALVO (TP)!** Lucro: R$ {pnl_brl:+.2f} (+{pnl_pct:.2f}%) em {ticker_frac}")
-            else:
-                st.error(f"🛑 **ROBÔ ENCERROU POSIÇÃO NO STOP LOSS (SL)!** Perda: R$ {pnl_brl:+.2f} ({pnl_pct:.2f}%) em {ticker_frac}")
-            set_last_bot_signal("COMPRA" if "COMPRA" in sinal else ("VENDA" if "VENDA" in sinal else "AGUARDAR"))
-            st.rerun()
-            
-    else:
-        # Se NÃO há trade aberto, o robô só pode entrar quando houver NOVA TRANSIÇÃO
-        # para COMPRA/VENDA. Isso impede reentrada infinita após TP/SL enquanto
-        # o mesmo sinal continua ativo em cada rerun do Streamlit.
-        sinal_operacional = "COMPRA" if "COMPRA" in sinal else ("VENDA" if "VENDA" in sinal else "AGUARDAR")
-        novo_sinal = sinal_operacional != ultimo_sinal
+                UPDATE trades
+                SET exit_time = ?, exit_price = ?, pnl_brl = ?, pnl_pct = ?,
+                    status = ?, exit_reason = ?
+                WHERE id = ? AND status = 'ABERTA'
+            """, (now_str, exit_price, pnl_brl, pnl_pct,
+                  exit_reason, exit_reason, t_id))
 
-        if robo_ativo and sinal_operacional in ("COMPRA", "VENDA") and novo_sinal:
-            # Calcula a quantidade no Lote Fracionário baseada no saldo disponível
-            qtd_frac = int(balance_atual // preco_abertura)
-            
+            # Devolve o capital investido + resultado ao saldo.
+            cursor.execute("""
+                UPDATE account
+                SET balance = balance + ?, pnl_total = pnl_total + ?
+                WHERE id = 1
+            """, (t_invested + pnl_brl, pnl_brl))
+
+            fechou_alguma = True
+            mensagens.append(
+                f"#{t_id} {t_side} {exit_reason}: R$ {pnl_brl:+.2f}"
+            )
+
+    conn.commit()
+
+    # 2) Reconsulta depois dos fechamentos para saber quantas continuam abertas.
+    cursor.execute("""
+        SELECT COUNT(*) FROM trades
+        WHERE ticker = ? AND status = 'ABERTA'
+    """, (ticker_selecionado,))
+    quantidade_abertas = int(cursor.fetchone()[0])
+
+    # 3) Nova entrada: somente se houver vaga no limite configurado.
+    #    A regra de transição de sinal continua sendo controlada por last_signal.
+    if robo_ativo and quantidade_abertas < int(max_operacoes) and ("COMPRA" in sinal or "VENDA" in sinal):
+        # Impede nova operação repetida no mesmo sinal/candle.
+        cursor.execute("""
+            SELECT side, entry_time
+            FROM trades
+            WHERE ticker = ?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (ticker_selecionado,))
+        ultima = cursor.fetchone()
+
+        pode_entrar = True
+        if ultima:
+            ultimo_side, ultimo_entry_time = ultima
+            # Não reabre imediatamente a mesma direção após um fechamento.
+            if ultimo_side == ("COMPRA" if "COMPRA" in sinal else "VENDA"):
+                pode_entrar = False
+
+        if pode_entrar:
+            balance_disponivel, _ = get_account_info()
+            qtd_frac = int(balance_disponivel // preco_abertura)
+
             if qtd_frac >= 1:
                 valor_investido = qtd_frac * preco_abertura
                 side = "COMPRA" if "COMPRA" in sinal else "VENDA"
-                
+
                 cursor.execute("""
-                    INSERT INTO trades 
-                    (ticker, ticker_frac, side, entry_time, entry_price, stop_price, target_price, qty, invested, status, strategy)
+                    INSERT INTO trades
+                    (ticker, ticker_frac, side, entry_time, entry_price,
+                     stop_price, target_price, qty, invested, status, strategy)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ABERTA', 'GEX_B3_AUTOMATICO')
-                """, (ticker_selecionado, ticker_frac, side, now_str, preco_abertura, stop_sl, alvo_tp, qtd_frac, valor_investido))
-                
-                # Desconta o valor investido do saldo disponível
-                novo_saldo = balance_atual - valor_investido
-                cursor.execute("UPDATE account SET balance = ? WHERE id = 1", (novo_saldo,))
+                """, (ticker_selecionado, ticker_frac, side, now_str,
+                      preco_abertura, stop_sl, alvo_tp, qtd_frac, valor_investido))
+
+                cursor.execute(
+                    "UPDATE account SET balance = balance - ? WHERE id = 1",
+                    (valor_investido,),
+                )
                 conn.commit()
-                set_last_bot_signal(sinal_operacional)
-                
-                st.toast(f"🤖 **ROBÔ EXECUTOU ENTRADA AUTOMÁTICA!** {side} de {qtd_frac} ações de `{ticker_frac}` a R$ {preco_abertura:.2f}", icon="🚀")
-                st.rerun()
-            else:
-                set_last_bot_signal(sinal_operacional)
-                st.warning(f"⚠️ **Saldo Insuficiente**: Saldo R$ {balance_atual:,.2f} não compra 1 ação de {ticker_frac} (Preço: R$ {preco_abertura:,.2f}). Ajuste a banca na barra lateral.")
-        else:
-            # Persiste o último sinal observado. Só uma nova transição para
-            # COMPRA/VENDA libera uma nova entrada.
-            set_last_bot_signal(sinal_operacional)
+                quantidade_abertas += 1
+                st.toast(
+                    f"🤖 Entrada automática #{quantidade_abertas}: {side} de {qtd_frac} ações de {ticker_frac} a R$ {preco_abertura:.2f}",
+                    icon="🚀",
+                )
 
     conn.close()
+
+    # Atualiza a interface apenas uma vez após processar todos os trades.
+    if mensagens:
+        for msg in mensagens:
+            st.toast(f"🤖 {msg}", icon="💰")
+    if fechou_alguma:
+        st.rerun()
 
 processar_robo_automatico()
 
