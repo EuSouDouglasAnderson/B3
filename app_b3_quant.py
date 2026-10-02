@@ -80,6 +80,13 @@ def init_db():
             strategy TEXT DEFAULT 'GEX_B3_AUTOMATICO'
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_signal TEXT DEFAULT 'AGUARDAR'
+        )
+    """)
+    cursor.execute("INSERT OR IGNORE INTO bot_state (id, last_signal) VALUES (1, 'AGUARDAR')")
     cursor.execute("SELECT COUNT(*) FROM account")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO account (balance, pnl_total) VALUES (100.0, 0.0)")
@@ -113,6 +120,7 @@ def reset_db(initial_capital=100.0):
     cursor = conn.cursor()
     cursor.execute("DELETE FROM trades")
     cursor.execute("UPDATE account SET balance = ?, pnl_total = 0.0 WHERE id = 1", (initial_capital,))
+    cursor.execute("UPDATE bot_state SET last_signal = 'AGUARDAR' WHERE id = 1")
     conn.commit()
     conn.close()
 
@@ -183,7 +191,8 @@ st.sidebar.markdown("---")
 st.sidebar.info(
     f"📌 **Mercado Fracionário**: `{ticker_frac}`\n\n"
     f"🔄 **Auto-Refresh**: 5 minutos\n\n"
-    f"⏱️ **Hora Atual**: {datetime.now().strftime('%H:%M:%S')}"
+    f"⏱️ **Hora Atual**: {datetime.now().strftime('%H:%M:%S')}\n\n"
+    f"🛡️ **Proteção**: 1 entrada por transição de sinal"
 )
 
 # ============================================================
@@ -277,12 +286,30 @@ else:
         sinal = "AGUARDAR 🟡"
         diagnostico = f"Bloqueado: Alvo R$ {alvo_tp:.2f} ultrapassa a Put Wall (R$ {put_wall:.2f}). Espaço livre insuficiente para o risco."
 
+def get_last_bot_signal():
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT last_signal FROM bot_state WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else "AGUARDAR"
+
+
+def set_last_bot_signal(signal_value):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE bot_state SET last_signal = ? WHERE id = 1", (signal_value,))
+    conn.commit()
+    conn.close()
+
+
 # ============================================================
 # MOTOR DE EXECUÇÃO AUTOMÁTICA (ROBÔ SQLITE)
 # ============================================================
 def processar_robo_automatico():
     conn = get_conn()
     cursor = conn.cursor()
+    ultimo_sinal = get_last_bot_signal()
     
     # 1. Verifica se já existe trade ABERTO para este ticker
     cursor.execute("""
@@ -344,11 +371,17 @@ def processar_robo_automatico():
                 st.success(f"🎯 **ROBÔ ENCERROU POSIÇÃO NO ALVO (TP)!** Lucro: R$ {pnl_brl:+.2f} (+{pnl_pct:.2f}%) em {ticker_frac}")
             else:
                 st.error(f"🛑 **ROBÔ ENCERROU POSIÇÃO NO STOP LOSS (SL)!** Perda: R$ {pnl_brl:+.2f} ({pnl_pct:.2f}%) em {ticker_frac}")
+            set_last_bot_signal("COMPRA" if "COMPRA" in sinal else ("VENDA" if "VENDA" in sinal else "AGUARDAR"))
             st.rerun()
             
     else:
-        # Se NÃO há trade aberto e o robô está ativo e há sinal válido de COMPRA ou VENDA
-        if robo_ativo and ("COMPRA" in sinal or "VENDA" in sinal):
+        # Se NÃO há trade aberto, o robô só pode entrar quando houver NOVA TRANSIÇÃO
+        # para COMPRA/VENDA. Isso impede reentrada infinita após TP/SL enquanto
+        # o mesmo sinal continua ativo em cada rerun do Streamlit.
+        sinal_operacional = "COMPRA" if "COMPRA" in sinal else ("VENDA" if "VENDA" in sinal else "AGUARDAR")
+        novo_sinal = sinal_operacional != ultimo_sinal
+
+        if robo_ativo and sinal_operacional in ("COMPRA", "VENDA") and novo_sinal:
             # Calcula a quantidade no Lote Fracionário baseada no saldo disponível
             qtd_frac = int(balance_atual // preco_abertura)
             
@@ -366,11 +399,17 @@ def processar_robo_automatico():
                 novo_saldo = balance_atual - valor_investido
                 cursor.execute("UPDATE account SET balance = ? WHERE id = 1", (novo_saldo,))
                 conn.commit()
+                set_last_bot_signal(sinal_operacional)
                 
                 st.toast(f"🤖 **ROBÔ EXECUTOU ENTRADA AUTOMÁTICA!** {side} de {qtd_frac} ações de `{ticker_frac}` a R$ {preco_abertura:.2f}", icon="🚀")
                 st.rerun()
             else:
+                set_last_bot_signal(sinal_operacional)
                 st.warning(f"⚠️ **Saldo Insuficiente**: Saldo R$ {balance_atual:,.2f} não compra 1 ação de {ticker_frac} (Preço: R$ {preco_abertura:,.2f}). Ajuste a banca na barra lateral.")
+        else:
+            # Persiste o último sinal observado. Só uma nova transição para
+            # COMPRA/VENDA libera uma nova entrada.
+            set_last_bot_signal(sinal_operacional)
 
     conn.close()
 
