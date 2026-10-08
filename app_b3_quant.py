@@ -5,7 +5,6 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 import yfinance as yf
 
@@ -13,7 +12,7 @@ import yfinance as yf
 # CONFIGURAÇÃO DA PÁGINA STREAMLIT
 # ============================================================
 st.set_page_config(
-    page_title="B3 Quant Robo - Monitor & Simulador",
+    page_title="B3 Quant Robo - Consolidação GEX & Quant",
     page_icon="📈",
     layout="wide",
 )
@@ -188,8 +187,9 @@ if timeframe != saved_tf:
     save_setting("timeframe", timeframe)
 
 estrategia_opcoes = [
-    "Estratégia G — Expansão de Abertura (1.5%)",
     "Estratégia F — First Touch (Paredes GEX)",
+    "Estratégia G — Expansão de Abertura (1.5%)",
+    "Estratégia CRSI — Connors RSI (Exaustão)",
     "Estratégia Volatilidade — ATR (2.0x ATR)"
 ]
 saved_strat = get_setting("estrategia", estrategia_opcoes[0])
@@ -250,6 +250,46 @@ def carregar_dados_b3(symbol, period, interval):
     except Exception as e:
         return pd.DataFrame()
 
+def calcular_connors_rsi(df):
+    if len(df) < 20:
+        return pd.Series(50.0, index=df.index)
+    
+    # 1. RSI de 3 períodos
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(3).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(3).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi3 = 100 - (100 / (1 + rs))
+
+    # 2. Streak (Sequência de altas/baixas)
+    streak = pd.Series(0.0, index=df.index)
+    s = 0.0
+    for i in range(1, len(df)):
+        if df['Close'].iloc[i] > df['Close'].iloc[i-1]:
+            s = s + 1.0 if s > 0 else 1.0
+        elif df['Close'].iloc[i] < df['Close'].iloc[i-1]:
+            s = s - 1.0 if s < 0 else -1.0
+        else:
+            s = 0.0
+        streak.iloc[i] = s
+
+    s_delta = streak.diff()
+    s_gain = (s_delta.where(s_delta > 0, 0)).rolling(2).mean()
+    s_loss = (-s_delta.where(s_delta < 0, 0)).rolling(2).mean()
+    s_rs = s_gain / s_loss.replace(0, np.nan)
+    rsi_streak = 100 - (100 / (1 + s_rs))
+
+    # 3. PercentRank das mudanças de 1 período nos últimos 100 barras
+    pct_change = df['Close'].pct_change()
+    def pct_rank_fn(x):
+        if len(x) <= 1:
+            return 50.0
+        return (x[:-1] < x[-1]).sum() / (len(x) - 1) * 100.0
+
+    pct_rank = pct_change.rolling(min(100, len(df))).apply(pct_rank_fn, raw=True)
+    crsi = (rsi3.fillna(50) + rsi_streak.fillna(50) + pct_rank.fillna(50)) / 3.0
+    return crsi.fillna(50.0)
+
 df_raw = carregar_dados_b3(ticker_selecionado, periodo_yf, intervalo_yf)
 
 if df_raw.empty:
@@ -263,6 +303,7 @@ df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
 df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 df["Call_Wall"] = df["High"].rolling(window=20).max()
 df["Put_Wall"] = df["Low"].rolling(window=20).min()
+df["CRSI"] = calcular_connors_rsi(df)
 
 high_low = df["High"] - df["Low"]
 high_close = np.abs(df["High"] - df["Close"].shift())
@@ -274,32 +315,56 @@ row_atual = df.iloc[-1]
 preco_atual = float(row_atual["Close"])
 high_atual = float(row_atual["High"])
 low_atual = float(row_atual["Low"])
-preco_abertura = float(df["Open"].iloc[0] if "5m" in timeframe else row_atual["Open"])
+
+# Abertura EXATA do dia atual (Hoje)
+df_hoje = df[df.index.date == df.index[-1].date()] if hasattr(df.index, 'date') else df
+preco_abertura = float(df_hoje["Open"].iloc[0]) if not df_hoje.empty else float(row_atual["Open"])
+
 call_wall = float(row_atual["Call_Wall"])
 put_wall = float(row_atual["Put_Wall"])
 atr = float(row_atual["ATR14"]) if not np.isnan(row_atual["ATR14"]) else 1.0
 ema20 = float(row_atual["EMA20"])
 ema50 = float(row_atual["EMA50"])
+crsi_atual = float(row_atual["CRSI"])
 
 regime = "ALTA 🟢" if ema20 > ema50 else "BAIXA 🔴"
 
-# Definição do Sinal do Painel
+# ============================================================
+# LÓGICA DE SINAL E VALIDAÇÃO QUANTITATIVA DE ESPAÇO LIVRE
+# ============================================================
 if "First Touch" in estrategia_selecionada:
     dist_call = call_wall - preco_atual
     dist_put = preco_atual - put_wall
-    if dist_call <= (preco_atual * 0.003):
-        sinal = "VENDA (SHORT) 🔴"
-        diagnostico = f"Toque na Call Wall (R$ {call_wall:.2f}). Entrada de Venda por Rejeição de Resistência."
+    
+    # Tolerância de toque: 0.3% da parede
+    no_teto = dist_call <= (preco_atual * 0.003)
+    no_piso = dist_put <= (preco_atual * 0.003)
+
+    if no_teto:
         alvo_tp = preco_atual * 0.985
         stop_sl = preco_atual * 1.0075
-    elif dist_put <= (preco_atual * 0.003):
-        sinal = "COMPRA (LONG) 🟢"
-        diagnostico = f"Toque na Put Wall (R$ {put_wall:.2f}). Entrada de Compra por Defesa de Suporte."
+        # Validação: Alvo de venda não pode colidir/passar da Put Wall
+        if alvo_tp >= put_wall:
+            sinal = "VENDA (SHORT) 🔴"
+            diagnostico = f"Toque na Call Wall (R$ {call_wall:.2f}). Entrada de Venda por Rejeição de Resistência."
+        else:
+            sinal = "AGUARDAR 🟡"
+            diagnostico = f"Bloqueado: Alvo de Venda R$ {alvo_tp:.2f} ultrapassa a Put Wall (R$ {put_wall:.2f}). Espaço livre insuficiente."
+
+    elif no_piso:
         alvo_tp = preco_atual * 1.015
         stop_sl = preco_atual * 0.9925
+        # Validação RÍGIDA: Alvo de compra NÃO PODE colidir com a Call Wall
+        if alvo_tp <= call_wall:
+            sinal = "COMPRA (LONG) 🟢"
+            diagnostico = f"Toque na Put Wall (R$ {put_wall:.2f}). Entrada de Compra por Defesa de Suporte."
+        else:
+            sinal = "AGUARDAR 🟡"
+            diagnostico = f"Bloqueado: Alvo R$ {alvo_tp:.2f} colide com a Call Wall (R$ {call_wall:.2f}). Espaço livre insuficiente até o teto."
+
     else:
         sinal = "AGUARDAR FIRST TOUCH 🟡"
-        diagnostico = f"Preço flutuando no corredor. Call Wall em R$ {call_wall:.2f} (+R$ {dist_call:.2f}) | Put Wall em R$ {put_wall:.2f} (-R$ {dist_put:.2f})."
+        diagnostico = f"Preço no corredor. Call Wall em R$ {call_wall:.2f} (+R$ {dist_call:.2f}) | Put Wall em R$ {put_wall:.2f} (-R$ {dist_put:.2f})."
         alvo_tp = preco_atual * 1.015
         stop_sl = preco_atual * 0.9925
 
@@ -312,7 +377,7 @@ elif "Expansão" in estrategia_selecionada:
         tem_espaco = alvo_tp <= call_wall
         if tem_espaco:
             sinal = "COMPRA (LONG) 🟢"
-            diagnostico = f"Tendência de alta. Espaço livre até a Call Wall (R$ {call_wall:.2f})."
+            diagnostico = f"Tendência de alta a partir da abertura (R$ {preco_abertura:.2f}). Espaço livre até a Call Wall (R$ {call_wall:.2f})."
         else:
             sinal = "AGUARDAR 🟡"
             diagnostico = f"Bloqueado: Alvo R$ {alvo_tp:.2f} colide com a Call Wall (R$ {call_wall:.2f})."
@@ -322,12 +387,39 @@ elif "Expansão" in estrategia_selecionada:
         tem_espaco = alvo_tp >= put_wall
         if tem_espaco:
             sinal = "VENDA (SHORT) 🔴"
-            diagnostico = f"Tendência de baixa. Espaço livre acima da Put Wall (R$ {put_wall:.2f})."
+            diagnostico = f"Tendência de baixa a partir da abertura (R$ {preco_abertura:.2f}). Espaço livre acima da Put Wall (R$ {put_wall:.2f})."
         else:
             sinal = "AGUARDAR 🟡"
             diagnostico = f"Bloqueado: Alvo R$ {alvo_tp:.2f} colide com a Put Wall (R$ {put_wall:.2f})."
+
+elif "CRSI" in estrategia_selecionada:
+    # Connors RSI: < 20 Sobrevendido (Compra), > 80 Sobrecomprado (Venda)
+    if crsi_atual <= 20.0:
+        alvo_tp = preco_atual * 1.015
+        stop_sl = preco_atual * 0.9925
+        if alvo_tp <= call_wall:
+            sinal = "COMPRA (LONG) 🟢"
+            diagnostico = f"Exaustão Vendedora (CRSI: {crsi_atual:.1f} <= 20). Reversão para a Média."
+        else:
+            sinal = "AGUARDAR 🟡"
+            diagnostico = f"CRSI Sobrevendido ({crsi_atual:.1f}), mas Alvo R$ {alvo_tp:.2f} colide com a Call Wall (R$ {call_wall:.2f})."
+    elif crsi_atual >= 80.0:
+        alvo_tp = preco_atual * 0.985
+        stop_sl = preco_atual * 1.0075
+        if alvo_tp >= put_wall:
+            sinal = "VENDA (SHORT) 🔴"
+            diagnostico = f"Exaustão Compradora (CRSI: {crsi_atual:.1f} >= 80). Reversão para a Média."
+        else:
+            sinal = "AGUARDAR 🟡"
+            diagnostico = f"CRSI Sobrecomprado ({crsi_atual:.1f}), mas Alvo R$ {alvo_tp:.2f} colide com a Put Wall (R$ {put_wall:.2f})."
+    else:
+        sinal = "AGUARDAR CRSI 🟡"
+        diagnostico = f"Connors RSI em zona neutra ({crsi_atual:.1f}). Aguardando exaustão <= 20 ou >= 80."
+        alvo_tp = preco_atual * 1.015
+        stop_sl = preco_atual * 0.9925
+
 else:
-    # ATR
+    # ATR Volatilidade
     alvo_tp = preco_atual + (atr * 2.0) if regime == "ALTA 🟢" else preco_atual - (atr * 2.0)
     stop_sl = preco_atual - (atr * 1.0) if regime == "ALTA 🟢" else preco_atual + (atr * 1.0)
     sinal = "COMPRA (LONG) 🟢" if regime == "ALTA 🟢" else "VENDA (SHORT) 🔴"
@@ -404,7 +496,6 @@ def executar_robo_multiativos():
 
         if teto_alocacao >= 10.0:
             for symbol in LISTA_ATIVOS:
-                # Verifica se já há trade ABERTO para este ticker
                 cursor.execute("SELECT COUNT(*) FROM trades WHERE ticker = ? AND status = 'ABERTA'", (symbol,))
                 if cursor.fetchone()[0] > 0:
                     continue
@@ -414,7 +505,9 @@ def executar_robo_multiativos():
                     continue
 
                 p_c = float(df_a["Close"].iloc[-1])
-                p_o = float(df_a["Open"].iloc[0])
+                df_a_hoje = df_a[df_a.index.date == df_a.index[-1].date()] if hasattr(df_a.index, 'date') else df_a
+                p_o = float(df_a_hoje["Open"].iloc[0]) if not df_a_hoje.empty else float(df_a["Open"].iloc[-1])
+
                 cw = float(df_a["High"].rolling(20).max().iloc[-1])
                 pw = float(df_a["Low"].rolling(20).min().iloc[-1])
                 em20 = float(df_a["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
@@ -426,20 +519,36 @@ def executar_robo_multiativos():
 
                 if "First Touch" in estrategia_selecionada:
                     if (cw - p_c) <= (p_c * 0.003):
-                        sinal_acao = "VENDA"
                         tgt_price = ent_price * 0.985
                         stp_price = ent_price * 1.0075
+                        if tgt_price >= pw: # Trava de colisão com a Put Wall
+                            sinal_acao = "VENDA"
                     elif (p_c - pw) <= (p_c * 0.003):
-                        sinal_acao = "COMPRA"
                         tgt_price = ent_price * 1.015
                         stp_price = ent_price * 0.9925
+                        if tgt_price <= cw: # Trava de colisão com a Call Wall
+                            sinal_acao = "COMPRA"
+
                 elif "Expansão" in estrategia_selecionada:
                     if reg_a == "ALTA":
+                        tgt_price = p_o * 1.015
+                        stp_price = p_o * 0.9925
+                        if tgt_price <= cw:
+                            sinal_acao = "COMPRA"
+                    else:
+                        tgt_price = p_o * 0.985
+                        stp_price = p_o * 1.0075
+                        if tgt_price >= pw:
+                            sinal_acao = "VENDA"
+
+                elif "CRSI" in estrategia_selecionada:
+                    crsi_val = float(calcular_connors_rsi(df_a).iloc[-1])
+                    if crsi_val <= 20.0:
                         tgt_price = ent_price * 1.015
                         stp_price = ent_price * 0.9925
                         if tgt_price <= cw:
                             sinal_acao = "COMPRA"
-                    else:
+                    elif crsi_val >= 80.0:
                         tgt_price = ent_price * 0.985
                         stp_price = ent_price * 1.0075
                         if tgt_price >= pw:
@@ -459,7 +568,7 @@ def executar_robo_multiativos():
                         nova_banca = saldo_livre - investido
                         cursor.execute("UPDATE account SET balance = ? WHERE id = 1", (nova_banca,))
                         conn.commit()
-                        break # Executa 1 por ciclo para manter diversificação
+                        break
 
     conn.close()
 
@@ -474,12 +583,13 @@ balance_atual, pnl_total_acumulado = get_account_info()
 st.title(f"📊 B3 Quant Robo — {ticker_selecionado} ({ticker_frac})")
 st.caption(f"Varredura Automática de 22 Ativos • {estrategia_selecionada} • Atualizado às {datetime.now().strftime('%H:%M:%S')}")
 
-m1, m2, m3, m4, m5 = st.columns(5)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("Preço Atual", f"R$ {preco_atual:,.2f}")
-m2.metric("Abertura (Âncora)", f"R$ {preco_abertura:,.2f}")
+m2.metric("Abertura Hoje", f"R$ {preco_abertura:,.2f}")
 m3.metric("Call Wall (Teto)", f"R$ {call_wall:,.2f}", f"Dist: R$ {call_wall - preco_atual:+.2f}")
 m4.metric("Put Wall (Piso)", f"R$ {put_wall:,.2f}", f"Dist: R$ {preco_atual - put_wall:+.2f}")
 m5.metric("Regime EMA", regime)
+m6.metric("Connors RSI", f"{crsi_atual:.1f}")
 
 # Card Principal
 cor_card = "#1e3a29" if "COMPRA" in sinal else ("#3a1e1e" if "VENDA" in sinal else "#3a321e")
@@ -544,7 +654,7 @@ fig.add_hline(
     y=preco_abertura,
     line_dash="dash",
     line_color="#29b6f6",
-    annotation_text=f"Abertura: R$ {preco_abertura:.2f}",
+    annotation_text=f"Abertura Hoje: R$ {preco_abertura:.2f}",
     annotation_position="bottom right",
 )
 
@@ -598,7 +708,6 @@ with tab1:
         for trade in abertas:
             tid, t_sym, t_frac, t_side, t_time, t_entry, t_stop, t_target, t_qty, t_invest = trade
 
-            # PnL em tempo real
             df_curr = carregar_dados_b3(t_sym, "5d", "5m")
             p_now = float(df_curr["Close"].iloc[-1]) if not df_curr.empty else t_entry
 
