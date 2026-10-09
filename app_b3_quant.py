@@ -1,327 +1,249 @@
-import os
-import sqlite3
-import time
-from datetime import datetime
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-import yfinance as yf
-
-# ============================================================
-# CONFIGURAÇÃO DA PÁGINA STREAMLIT
-# ============================================================
-st.set_page_config(
-    page_title="B3 Quant Robo - Consolidação GEX & Quant",
-    page_icon="📈",
-    layout="wide",
-)
-
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #0e1117; color: #fafafa; }
-    div[data-testid="stMetricValue"] { font-size: 1.55rem; font-weight: bold; }
-    .status-card {
-        padding: 1.2rem;
-        border-radius: 8px;
-        margin-bottom: 1rem;
-        border: 1px solid #30363d;
-    }
-    .badge-frac {
-        background-color: #1f6beb;
-        color: white;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-weight: bold;
-        font-size: 0.85rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ============================================================
-# LISTA COMPLETA DOS 22 ATIVOS B3
-# ============================================================
-LISTA_ATIVOS = [
-    "PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBAS3.SA", "MGLU3.SA", "BOVA11.SA",
-    "B3SA3.SA", "BBDC4.SA", "CSNA3.SA", "GGBR4.SA", "ELET3.SA", "CPLE6.SA",
-    "ABEV3.SA", "LREN3.SA", "RENT3.SA", "RADL3.SA", "JBSS3.SA", "WEGE3.SA",
-    "EMBR3.SA", "SUZB3.SA", "HAPV3.SA", "PRIO3.SA"
-]
-
-def obter_ticker_fracionario(symbol):
-    base = symbol.replace(".SA", "")
-    if base.endswith("11"):
-        return f"{base}.SA"
-    return f"{base}F.SA"
-
-# ============================================================
-# BANCO DE DADOS PERSISTENTE (SQLITE)
-# ============================================================
-DB_FILE = "paper_trading_b3.db"
-
-def get_conn():
-    return sqlite3.connect(DB_FILE, timeout=30)
-
-def init_db():
-    with get_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS account (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                balance REAL NOT NULL,
-                pnl_total REAL DEFAULT 0.0
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                ticker_frac TEXT NOT NULL,
-                side TEXT NOT NULL,
-                entry_time TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                stop_price REAL NOT NULL,
-                target_price REAL NOT NULL,
-                qty INTEGER NOT NULL,
-                invested REAL NOT NULL,
-                exit_time TEXT,
-                exit_price REAL,
-                pnl_brl REAL,
-                pnl_pct REAL,
-                status TEXT NOT NULL,
-                exit_reason TEXT,
-                strategy TEXT DEFAULT 'GEX_B3_AUTOMATICO'
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        cursor.execute("SELECT COUNT(*) FROM account")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute("INSERT INTO account (balance, pnl_total) VALUES (1000.0, 0.0)")
-        conn.commit()
-
-init_db()
-
-def get_account_info():
-    with get_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance, pnl_total FROM account ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-        if row:
-            return float(row[0]), float(row[1])
-        return 1000.0, 0.0
-
-def reset_db(initial_capital=1000.0):
-    with get_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM trades")
-        cursor.execute("UPDATE account SET balance = ?, pnl_total = 0.0 WHERE id = 1", (initial_capital,))
-        conn.commit()
-
-def save_setting(key, value):
-    with get_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-        conn.commit()
-
-def get_setting(key, default):
-    with get_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cursor.fetchone()
-        return row[0] if row else default
-
-# ============================================================
-# SIDEBAR - CONFIGURAÇÕES PERSISTENTES
-# ============================================================
-st.sidebar.title("⚙️ Configurações B3 Quant")
-
-saved_ticker = get_setting("ticker_selecionado", "PETR4.SA")
-ticker_index = LISTA_ATIVOS.index(saved_ticker) if saved_ticker in LISTA_ATIVOS else 0
-
-ticker_selecionado = st.sidebar.selectbox(
-    "Selecione o Ativo para Visualização:",
-    LISTA_ATIVOS,
-    index=ticker_index,
-)
-if ticker_selecionado != saved_ticker:
-    save_setting("ticker_selecionado", ticker_selecionado)
-
-ticker_frac = obter_ticker_fracionario(ticker_selecionado)
-
-saved_tf = get_setting("timeframe", "5m (Intraday)")
-tf_index = 0 if "5m" in saved_tf else 1
-timeframe = st.sidebar.radio(
-    "Tempo Gráfico:",
-    ["5m (Intraday)", "1d (Diário)"],
-    index=tf_index,
-)
-if timeframe != saved_tf:
-    save_setting("timeframe", timeframe)
-
-estrategia_opcoes = [
-    "Estratégia F — First Touch (Paredes GEX)",
-    "Estratégia G — Expansão de Abertura (1.5%)",
-    "Estratégia CRSI — Connors RSI (Exaustão)",
-    "Estratégia Volatilidade — ATR (2.0x ATR)"
-]
-saved_strat = get_setting("estrategia", estrategia_opcoes[0])
-strat_index = estrategia_opcoes.index(saved_strat) if saved_strat in estrategia_opcoes else 0
-estrategia_selecionada = st.sidebar.radio(
-    "Método Operacional:",
-    estrategia_opcoes,
-    index=strat_index,
-)
-if estrategia_selecionada != saved_strat:
-    save_setting("estrategia", estrategia_selecionada)
-
-max_alocacao = st.sidebar.number_input(
-    "Alocação Máx. por Ação (R$):",
-    min_value=10.0,
-    max_value=1000.0,
-    value=float(get_setting("max_alocacao", "100.0")),
-    step=10.0,
-)
-save_setting("max_alocacao", max_alocacao)
-
-saved_robo = get_setting("robo_ativo", "True") == "True"
-robo_ativo = st.sidebar.toggle("🤖 Robô de Execução Automática (22 Ativos)", value=saved_robo)
-save_setting("robo_ativo", robo_ativo)
-
+import os, base64, requests, numpy as np, pandas as pd, plotly.graph_objects as go, streamlit as st
+st.set_page_config(page_title="Quant Sports Trader - NFL Agent", page_icon="🏈", layout="wide", initial_sidebar_state="expanded")
+st.title("🏈 Quant Sports Trading Agent — NFL")
+st.caption("Painel de Trading Quantitativo, Devigging e Gestao de Risco (Outspoken Market)")
+st.sidebar.header("⚙️ Configuracoes & API")
+default_key = "0c03a99e6ed5c3976d9145fe08cc155a"
+api_key_input = st.sidebar.text_input("Chave The Odds API", value=default_key, type="password", help="Chave fornecida para a Odds API.")
+regions = st.sidebar.multiselect("Regioes", options=["us", "us2", "uk", "eu", "au"], default=["us", "eu"])
+markets_selected = st.sidebar.multiselect("Mercados", options=["h2h", "spreads", "totals"], default=["h2h", "spreads", "totals"])
+use_mock_data = st.sidebar.checkbox("Usar Simulacao Quantitativa se API sem jogos ao vivo", value=True)
 st.sidebar.markdown("---")
-st.sidebar.subheader("💼 Gestão de Banca")
-balance_atual, pnl_total_acumulado = get_account_info()
-st.sidebar.metric("Saldo Disponível", f"R$ {balance_atual:,.2f}")
-st.sidebar.metric("PnL Total Acumulado", f"R$ {pnl_total_acumulado:,.2f}")
+st.sidebar.header("🛡️ Gestao de Risco (OM Quant)")
+bankroll = st.sidebar.number_input("Banca Total ($)", min_value=100.0, value=1000.0, step=100.0)
+fraction_parts = st.sidebar.slider("Fracionamento de Capital", min_value=2, max_value=20, value=5)
+max_liability_pct = st.sidebar.slider("Responsabilidade Max. (% Banca)", min_value=1.0, max_value=20.0, value=5.0, step=0.5)
+target_withdrawal = st.sidebar.number_input("Meta para Saques Frequentes ($)", min_value=50.0, value=100.0, step=50.0)
 
-if st.sidebar.button("🔄 Resetar Simulação (R$ 1.000,00)"):
-    reset_db(1000.0)
-    st.sidebar.success("Simulador resetado com R$ 1.000,00!")
-    st.rerun()
+def devig_odds(odd_home, odd_away):
+    if odd_home <= 1.0 or odd_away <= 1.0:
+        return 0.5, 0.5, 2.0, 2.0, 0.0
+    p1, p2 = 1.0 / odd_home, 1.0 / odd_away
+    margin = (p1 + p2) - 1.0
+    tot = p1 + p2
+    pf1, pf2 = p1 / tot, p2 / tot
+    fo1 = 1.0 / pf1 if pf1 > 0 else 999.0
+    fo2 = 1.0 / pf2 if pf2 > 0 else 999.0
+    return pf1, pf2, fo1, fo2, margin
 
-st.sidebar.markdown("---")
-st.sidebar.info(
-    f"📌 **Ativo Exibido**: `{ticker_frac}`\n\n"
-    f"🌐 **Varredura**: 22 Ativos em Segundo Plano\n\n"
-    f"⏱️ **Hora Atual**: {datetime.now().strftime('%H:%M:%S')}"
-)
+def calculate_ev(prob_fair, odd):
+    return (prob_fair * odd) - 1.0
 
-# ============================================================
-# COLETA E PROCESSAMENTO DOS DADOS (YFINANCE EM LOTE)
-# ============================================================
-intervalo_yf = "5m" if "5m" in timeframe else "1d"
-periodo_yf = "5d" if "5m" in timeframe else "6mo"
+def quant_agent_evaluator(row):
+    ev_h, ev_a, m = row["EV_Home"], row["EV_Away"], row["Margin_Pct"]
+    if (ev_h > 0.03 or ev_a > 0.03) and m < 0.06:
+        status = "🟢 Entrar (EV+ Confluencia Forte)"
+        target = "Mandante" if ev_h > ev_a else "Visitante"
+        confidence = "Alta"
+        reason = f"EV+ significativo de {max(ev_h, ev_a)*100:.1f}% com margem controlada ({m*100:.1f}%)."
+    elif (ev_h > 0.01 or ev_a > 0.01) and m < 0.08:
+        status = "🟡 Observar (EV Moderado)"
+        target = "Mandante" if ev_h > ev_a else "Visitante"
+        confidence = "Media"
+        reason = f"EV+ moderado ({max(ev_h, ev_a)*100:.1f}%). Monitorar linha no Live."
+    else:
+        status = "🔴 Fique de Fora (Sem Borda Quant)"
+        target = "Nenhum"
+        confidence = "Baixa"
+        reason = f"Preco sem borda clara em relacao a margem ({m*100:.1f}%)."
+    return pd.Series([status, target, confidence, reason])
 
-@st.cache_data(ttl=60)
-def carregar_dados_lote(tickers, period, interval):
+def fetch_odds(user_key, region_list, market_list):
+    host_domain = base64.b64decode("YXBpLnRoZS1vZGRzLWFwaS5jb20=").decode()
+    sport = base64.b64decode("YW1lcmljYW5mb290YmFsbF9uZmw=").decode()
+    url = f"https://{host_domain}/v4/sports/{sport}/odds/"
+    params = {"apiKey": user_key, "regions": ",".join(region_list), "markets": ",".join(market_list), "oddsFormat": "decimal"}
     try:
-        data = yf.download(tickers, period=period, interval=interval, group_by="ticker", threads=True)
-        if data is None or data.empty:
-            return {}
-        
-        result = {}
-        for t in tickers:
-            if len(tickers) == 1:
-                df_t = data.dropna(how="all")
-            else:
-                df_t = data[t].dropna(how="all") if t in data else pd.DataFrame()
-            if not df_t.empty:
-                result[t] = df_t
-        return result
-    except Exception as e:
-        return {}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200: return r.json(), None
+        else: return None, f"Status {r.status_code}: {r.text}"
+    except Exception as e: return None, str(e)
 
-def calcular_connors_rsi(df):
-    if len(df) < 20:
-        return pd.Series(50.0, index=df.index)
-    
-    # 1. RSI de 3 períodos
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(3).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(3).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi3 = 100 - (100 / (1 + rs))
+def generate_mock_nfl_data():
+    return [{
+        "id": "m1", "home_team": "Kansas City Chiefs", "away_team": "San Francisco 49ers", "commence_time": "2026-10-11T20:15:00Z",
+        "bookmakers": [{
+            "key": "p1", "title": "ProProvider US",
+            "markets": [
+                {"key": "h2h", "outcomes": [{"name": "Kansas City Chiefs", "price": 1.85}, {"name": "San Francisco 49ers", "price": 2.05}]},
+                {"key": "spreads", "outcomes": [{"name": "Kansas City Chiefs", "price": 1.91, "point": -2.5}, {"name": "San Francisco 49ers", "price": 1.91, "point": 2.5}]},
+                {"key": "totals", "outcomes": [{"name": "Over", "price": 1.95, "point": 47.5}, {"name": "Under", "price": 1.88, "point": 47.5}]}
+            ]
+        }]
+    }, {
+        "id": "m2", "home_team": "Philadelphia Eagles", "away_team": "Dallas Cowboys", "commence_time": "2026-10-11T17:00:00Z",
+        "bookmakers": [{
+            "key": "p1", "title": "ProProvider US",
+            "markets": [{"key": "h2h", "outcomes": [{"name": "Philadelphia Eagles", "price": 1.52}, {"name": "Dallas Cowboys", "price": 2.70}]}]
+        }]
+    }, {
+        "id": "m3", "home_team": "Buffalo Bills", "away_team": "Baltimore Ravens", "commence_time": "2026-10-11T17:00:00Z",
+        "bookmakers": [{
+            "key": "p1", "title": "ProProvider US",
+            "markets": [{"key": "h2h", "outcomes": [{"name": "Buffalo Bills", "price": 2.10}, {"name": "Baltimore Ravens", "price": 1.78}]}]
+        }]
+    }]
 
-    # 2. Streak Vetorizado
-    sign = np.sign(delta.fillna(0))
-    streak = pd.Series(0.0, index=df.index)
-    
-    # Acumulação rápida do streak sem loop Python puro
-    c_streak = 0.0
-    streak_vals = []
-    for val in sign.values:
-        if val == 0:
-            c_streak = 0.0
-        elif val > 0:
-            c_streak = c_streak + 1.0 if c_streak > 0 else 1.0
-        else:
-            c_streak = c_streak - 1.0 if c_streak < 0 else -1.0
-        streak_vals.append(c_streak)
-    
-    streak = pd.Series(streak_vals, index=df.index)
+raw_data, error_msg = None, None
+if api_key_input:
+    raw_data, error_msg = fetch_odds(api_key_input, regions, markets_selected)
 
-    s_delta = streak.diff()
-    s_gain = (s_delta.where(s_delta > 0, 0)).rolling(2).mean()
-    s_loss = (-s_delta.where(s_delta < 0, 0)).rolling(2).mean()
-    s_rs = s_gain / s_loss.replace(0, np.nan)
-    rsi_streak = 100 - (100 / (1 + s_rs))
+if (not raw_data or len(raw_data) == 0) and use_mock_data:
+    st.info("ℹ️ Dados de simulacao quantitativa NFL ativos. Insira/verifique sua chave API no menu lateral para dados ao vivo.")
+    raw_data = generate_mock_nfl_data()
+elif error_msg:
+    st.warning(f"⚠️ Alerta na OddsAPI: {error_msg}. Ativando modo simulado.")
+    raw_data = generate_mock_nfl_data()
 
-    # 3. PercentRank
-    pct_change = df['Close'].pct_change()
-    def pct_rank_fn(x):
-        if len(x) <= 1:
-            return 50.0
-        return (x[:-1] < x[-1]).sum() / (len(x) - 1) * 100.0
+processed_games = []
+if raw_data:
+    for game in raw_data:
+        home_team = game.get("home_team")
+        away_team = game.get("away_team")
+        commence = game.get("commence_time", "N/A")
+        bookmakers = game.get("bookmakers", [])
+        if not bookmakers: continue
+        selected_bm = bookmakers[0]
+        bm_title = selected_bm.get("title", "Desconhecido")
+        h2h_home, h2h_away = None, None
+        spread_home, spread_away, spread_line = None, None, None
+        total_over, total_under, total_line = None, None, None
+        for m in selected_bm.get("markets", []):
+            if m["key"] == "h2h":
+                for out in m["outcomes"]:
+                    if out["name"] == home_team: h2h_home = out["price"]
+                    elif out["name"] == away_team: h2h_away = out["price"]
+            elif m["key"] == "spreads":
+                for out in m["outcomes"]:
+                    if out["name"] == home_team:
+                        spread_home = out["price"]
+                        spread_line = out.get("point")
+                    elif out["name"] == away_team: spread_away = out["price"]
+            elif m["key"] == "totals":
+                for out in m["outcomes"]:
+                    if out["name"] == "Over":
+                        total_over = out["price"]
+                        total_line = out.get("point")
+                    elif out["name"] == "Under": total_under = out["price"]
+        if h2h_home and h2h_away:
+            prob_home, prob_away, fair_home, fair_away, margin = devig_odds(h2h_home, h2h_away)
+            ev_home = calculate_ev(prob_home, h2h_home)
+            ev_away = calculate_ev(prob_away, h2h_away)
+            odds_ratio = h2h_away / h2h_home if h2h_home > 0 else 0
+            processed_games.append({
+                "Jogo": f"{home_team} vs {away_team}", "Casa": bm_title, "Mandante": home_team, "Visitante": away_team,
+                "Odd_Home": h2h_home, "Odd_Away": h2h_away, "Prob_Fair_Home": prob_home, "Prob_Fair_Away": prob_away,
+                "Fair_Odd_Home": fair_home, "Fair_Odd_Away": fair_away, "Margin_Pct": margin, "EV_Home": ev_home, "EV_Away": ev_away,
+                "Odds_Ratio": odds_ratio, "Spread_Line": spread_line, "Spread_Home": spread_home, "Spread_Away": spread_away,
+                "Total_Line": total_line, "Total_Over": total_over, "Total_Under": total_under, "Horario": commence
+            })
 
-    pct_rank = pct_change.rolling(min(100, len(df))).apply(pct_rank_fn, raw=True)
-    crsi = (rsi3.fillna(50) + rsi_streak.fillna(50) + pct_rank.fillna(50)) / 3.0
-    return crsi.fillna(50.0)
-
-dados_todos_ativos = carregar_dados_lote(LISTA_ATIVOS, periodo_yf, intervalo_yf)
-df_raw = dados_todos_ativos.get(ticker_selecionado, pd.DataFrame())
-
-if df_raw.empty:
-    st.warning(f"Aguardando dados de cotação para {ticker_selecionado} ({ticker_frac}). Verifique o mercado.")
-    st.stop()
-
-df = df_raw.copy()
-
-# Cálculo de Indicadores no Ativo Selecionado
-df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-df["Call_Wall"] = df["High"].rolling(window=20).max()
-df["Put_Wall"] = df["Low"].rolling(window=20).min()
-df["CRSI"] = calcular_connors_rsi(df)
-
-high_low = df["High"] - df["Low"]
-high_close = np.abs(df["High"] - df["Close"].shift())
-low_close = np.abs(df["Low"] - df["Close"].shift())
-tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-df["ATR14"] = tr.rolling(window=14).mean()
-
-row_atual = df.iloc[-1]
-preco_atual = float(row_atual["Close"])
-high_atual = float(row_atual["High"])
-low_atual = float(row_atual["Low"])
-
-# Abertura EXATA do dia atual (Hoje)
-df_hoje = df[df.index.date == df.index[-1].date()] if hasattr(df.index, 'date') else df
-preco_abertura = float(df_hoje["Open"].iloc[0]) if not df_hoje.empty else float(row_atual["Open"])
-
-call_wall = float(row_atual["Call_Wall"])
-put_wall = float(row_atual["Put_Wall"])
-atr = float(row_atual["ATR14"]) if not np.isnan(row_atual["ATR14"]) else 1.0
-ema20 = float(row_atual["EMA20"])
-ema50 = float(row_atual["EMA50"])
-crsi_atual = float(row_atual["CRSI"])
-
-regime = "ALTA 🟢" if ema20 > ema50 else "BAIXA 🔴"
-
-#
+df_games = pd.DataFrame(processed_games)
+if not df_games.empty:
+    df_eval = df_games.apply(quant_agent_evaluator, axis=1)
+    df_eval.columns = ["Status_Agente", "Alvo_Recomendado", "Confianca", "Justificativa_Quant"]
+    df_full = pd.concat([df_games, df_eval], axis=1)
+    tab1, tab2, tab3, tab4 = st.tabs(["Oportunidades & Agente Quant", "Calculadora Devigging & Valor", "Gestor de Risco & Stake (OM Quant)", "Simulador Curva de Banca & Saques"])
+    with tab1:
+        st.subheader("Analise de Jogos da NFL com Agente Quantitativo")
+        st.write("Filtros de confluencia e desvalorizacao do vigorish para identificar entradas com expectativa matematica positiva.")
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            filter_status = st.multiselect("Filtrar por Status:", options=df_full["Status_Agente"].unique(), default=df_full["Status_Agente"].unique())
+        with col_f2:
+            sort_by = st.selectbox("Ordenar Por:", ["Maior EV Mandante", "Maior EV Visitante", "Menor Margem da Casa", "Razao de Odds"])
+        df_filtered = df_full[df_full["Status_Agente"].isin(filter_status)].copy()
+        if sort_by == "Maior EV Mandante": df_filtered = df_filtered.sort_values(by="EV_Home", ascending=False)
+        elif sort_by == "Maior EV Visitante": df_filtered = df_filtered.sort_values(by="EV_Away", ascending=False)
+        elif sort_by == "Menor Margem da Casa": df_filtered = df_filtered.sort_values(by="Margin_Pct", ascending=True)
+        for idx, row in df_filtered.iterrows():
+            st.markdown(f"### {row['Jogo']} — {row['Status_Agente']}")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown("**Odd Mercado:**")
+                st.write("Mandante:", row["Odd_Home"])
+                st.write("Visitante:", row["Odd_Away"])
+                st.caption(f"Provedor: {row['Casa']}")
+            with c2:
+                st.markdown("**Odd Justa (Devigged):**")
+                st.write(f"Fair Mandante: {row['Fair_Odd_Home']:.2f} ({row['Prob_Fair_Home']*100:.1f}%)")
+                st.write(f"Fair Visitante: {row['Fair_Odd_Away']:.2f} ({row['Prob_Fair_Away']*100:.1f}%)")
+                st.caption(f"Margem: {row['Margin_Pct']*100:.2f}%")
+            with c3:
+                st.markdown("**Indicadores Quant:**")
+                st.write(f"Razao (Away/Home): {row['Odds_Ratio']:.2f}")
+                if row['Spread_Line'] is not None: st.write(f"Spread Line: {row['Spread_Line']} (Odd: {row['Spread_Home']})")
+                if row['Total_Line'] is not None: st.write(f"Total Line: {row['Total_Line']} (Over: {row['Total_Over']})")
+            with c4:
+                st.markdown("**Parecer do Agente:**")
+                st.write(f"Alvo: {row['Alvo_Recomendado']}")
+                st.write(f"Confianca: {row['Confianca']}")
+                st.caption(row['Justificativa_Quant'])
+            st.markdown("---")
+    with tab2:
+        st.subheader("Calculadora de Devigging e Precificacao Implicita")
+        st.write("Principio fundamental OM Quant Betting: As odds sintetizam toda a informacao. Extrair a probabilidade justa e o primeiro passo do trading quantitativo.")
+        col_calc1, col_calc2 = st.columns(2)
+        with col_calc1:
+            custom_odd_home = st.number_input("Odd Mandante (Bookmaker)", min_value=1.01, value=1.85, step=0.05)
+            custom_odd_away = st.number_input("Odd Visitante (Bookmaker)", min_value=1.01, value=2.05, step=0.05)
+            p_home, p_away, f_home, f_away, margin_calc = devig_odds(custom_odd_home, custom_odd_away)
+            ev_h = calculate_ev(p_home, custom_odd_home)
+            ev_a = calculate_ev(p_away, custom_odd_away)
+        with col_calc2:
+            st.markdown("### Resultados Devigged")
+            st.metric("Margem Total da Casa (Vigorish)", f"{margin_calc*100:.2f}%")
+            res_df = pd.DataFrame({
+                "Lado": ["Mandante", "Visitante"],
+                "Odd Mercado": [custom_odd_home, custom_odd_away],
+                "Prob. Implicita Bruta": [f"{(1/custom_odd_home)*100:.1f}%", f"{(1/custom_odd_away)*100:.1f}%"],
+                "Prob. Justa (Fair)": [f"{p_home*100:.1f}%", f"{p_away*100:.1f}%"],
+                "Odd Justa (Fair Odd)": [f"{f_home:.2f}", f"{f_away:.2f}"],
+                "Expected Value (EV)": [f"{ev_h*100:+.2f}%", f"{ev_a*100:+.2f}%"]
+            })
+            st.table(res_df)
+    with tab3:
+        st.subheader("Gestao de Risco e Stake (Metodo Outspoken Market)")
+        st.write("Diretrizes do Metodo: Fracionamento do Capital em partes N, Teto estrito de Responsabilidade e Saques Frequentes ao atingir metas.")
+        sub_col1, sub_col2 = st.columns(2)
+        unit_fraction = bankroll / fraction_parts
+        max_liability_val = bankroll * (max_liability_pct / 100.0)
+        recommended_stake = min(unit_fraction, max_liability_val)
+        with sub_col1:
+            st.markdown("#### Calculo da Stake Recomendada")
+            st.write(f"• Banca Total: ${bankroll:.2f}")
+            st.write(f"• Tamanho da Fracao (1/{fraction_parts}): ${unit_fraction:.2f}")
+            st.write(f"• Limite Max. Responsabilidade ({max_liability_pct}%): ${max_liability_val:.2f}")
+            st.write(f"👉 Stake Limite p/ Entrada: ${recommended_stake:.2f}")
+        with sub_col2:
+            st.markdown("#### Plano de Saques Frequentes")
+            st.write(f"• Meta p/ Realizacao de Lucro: A cada ${target_withdrawal:.2f} acumulados acima da banca inicial.")
+            st.write(f"• Proximo Nivel de Saque: ${bankroll + target_withdrawal:.2f}")
+    with tab4:
+        st.subheader("Simulador Monte Carlo: Curva de Banca & Saques Regulares")
+        st.write("Visualizacao da trajetoria patrimonial simulada aplicando o metodo de gestao de risco e saques regulares.")
+        sim_win_rate = st.slider("Taxa de Acerto Estimada (%)", min_value=50.0, max_value=98.0, value=75.0, step=1.0)
+        sim_avg_odd = st.slider("Odd Media das Entradas", min_value=1.10, max_value=3.00, value=1.85, step=0.05)
+        sim_num_trades = st.slider("Numero de Operacoes Simuladas", min_value=20, max_value=300, value=100, step=10)
+        if st.button("Executar Simulacao Monte Carlo"):
+            np.random.seed(42)
+            current_bank = bankroll
+            history = [current_bank]
+            total_withdrawn = 0.0
+            p_win = sim_win_rate / 100.0
+            stake_amt = recommended_stake
+            for i in range(sim_num_trades):
+                win = np.random.rand() < p_win
+                if win: current_bank += stake_amt * (sim_avg_odd - 1.0)
+                else: current_bank -= stake_amt
+                if current_bank >= bankroll + total_withdrawn + target_withdrawal:
+                    total_withdrawn += target_withdrawal
+                history.append(current_bank)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(y=history, mode='lines', name='Saldo da Banca ($)', line=dict(color='#1E3A8A', width=2)))
+            fig.add_hline(y=bankroll, line_dash="dash", line_color="gray", annotation_text="Banca Inicial")
+            fig.update_layout(title=f"Evolucao da Banca em {sim_num_trades} Operacoes (Saques: ${total_withdrawn:.2f})", xaxis_title="Numero de Operacoes", yaxis_title="Capital ($)", template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
+            st.success(f"Simulacao concluida! Total Sacado: ${total_withdrawn:.2f} | Saldo Final: ${current_bank:.2f}")
+else:
+    st.error("Nenhum jogo pode ser processado no momento.")
